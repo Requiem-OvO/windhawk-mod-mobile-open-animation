@@ -356,6 +356,7 @@ Windhawk's process exclusion list.
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <cwchar>
 #include <string>
 #include <vector>
@@ -2217,6 +2218,108 @@ static bool WindhawkUiIconFile(std::wstring* out) {
     return true;
 }
 
+// The largest icon frame the process exe carries natively, read from its icon
+// groups (an RT_GROUP_ICON directory pointing at RT_ICON frame blobs), across
+// all groups.
+//
+// This cannot be probed, it has to be read. PrivateExtractIcons with
+// cxIcon = cyIcon = 0 answers with the group's first frame, not the largest:
+// fdm.exe's group starts with a 16px entry and still carries 256px at the end
+// (measured, its frames are 16/32/48/64/128/256). And asking it for a size the
+// file does not have does not fail, it returns a small frame blown up to fit -
+// notepad.exe still answers a 256px request with a 256px bitmap. Only a size
+// that is genuinely in the file may be requested, so the frame table is read
+// and the largest entry chosen.
+//
+// The width byte in the directory entry caps at 256 (ICO convention: 0 means
+// 256), and frames of 512px and beyond share that same 0 - a bad table read
+// would silently cap the choice at 256. So the true width comes from the frame
+// blob itself, which the entry's id field points at: a PNG frame's IHDR width,
+// or a classic frame's BITMAPINFOHEADER biWidth (exes store both forms - fdm's
+// 256px frame is a PNG, WPS's first entry is a plain frame of 512px).
+//
+// LoadLibraryExW with LOAD_LIBRARY_AS_DATAFILE maps the file for resource access
+// without executing any of its code; the cost is the same order as the probe it
+// replaces (mapping and parsing the exe, once per animation, only when the
+// window icon measured small). The largest entry across all groups wins - the
+// exe read here is the one of the window being animated, which usually carries
+// a single group anyway.
+struct GroupIconFrameScan {
+    int largestPx = 0;
+};
+
+// The frame's own width, from the header inside its resource blob.
+static int IconFrameNativePx(HMODULE module, WORD id) {
+    if (!id) return 0;
+    HRSRC hr = FindResourceW(module, MAKEINTRESOURCEW(id), (LPCWSTR)RT_ICON);
+    if (!hr) return 0;
+    HGLOBAL hg = LoadResource(module, hr);
+    if (!hg) return 0;
+    const BYTE* p = (const BYTE*)LockResource(hg);
+    DWORD size = SizeofResource(module, hr);
+    if (!p || size < 40) return 0;
+    // PNG signature: 89 'P' 'N' 'G' CR LF 1A LF, then IHDR's big-endian width at +16.
+    if (p[0] == 0x89 && p[1] == 'P' && p[2] == 'N' && p[3] == 'G' && p[4] == 0x0D &&
+        p[5] == 0x0A && p[6] == 0x1A && p[7] == 0x0A && size >= 20) {
+        return (int)(((DWORD)p[16] << 24) | ((DWORD)p[17] << 16) | ((DWORD)p[18] << 8) |
+                     (DWORD)p[19]);
+    }
+    BITMAPINFOHEADER bi = {};
+    memcpy(&bi, p, sizeof(bi));
+    return (int)bi.biWidth;
+}
+
+static BOOL CALLBACK GroupIconFrameEnum(HMODULE module, LPCWSTR type, LPWSTR name,
+                                        LONG_PTR param) {
+    HRSRC hr = FindResourceW(module, name, (LPCWSTR)RT_GROUP_ICON);
+    if (!hr) return TRUE;
+    HGLOBAL hg = LoadResource(module, hr);
+    if (!hg) return TRUE;
+    const BYTE* p = (const BYTE*)LockResource(hg);
+    DWORD resSize = SizeofResource(module, hr);
+    if (!p || resSize < 6) return TRUE;
+    const WORD count = *(const WORD*)(p + 4);
+    GroupIconFrameScan* scan = (GroupIconFrameScan*)param;
+    for (WORD i = 0; i < count && 6 + (i + 1) * 14 <= resSize; i++) {
+        const WORD id = *(const WORD*)(p + 6 + i * 14 + 12);
+        const int px = IconFrameNativePx(module, id);
+        if (px > scan->largestPx) scan->largestPx = px;
+    }
+    return TRUE;
+}
+
+static int ExeLargestNativePx(const wchar_t* exePath) {
+    if (!exePath || !*exePath) return 0;
+    HMODULE module =
+        LoadLibraryExW(exePath, nullptr, LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+    if (!module) return 0;
+    GroupIconFrameScan scan;
+    EnumResourceNamesW(module, (LPCWSTR)RT_GROUP_ICON, GroupIconFrameEnum, (LONG_PTR)&scan);
+    FreeLibrary(module);
+    return scan.largestPx;
+}
+
+// The exe's largest native icon frame, when it is larger than want.
+//
+// WPS is the measured case: its windows answer WM_GETICON with a 32px HICON while
+// the exe's icon group holds frames up to 512px, so the panel replaces the small
+// window icon with the exe's largest native frame, extracted at its own size - the
+// native pixels are never scaled on the way out. The frame table lookup above is
+// what makes this safe on every exe: an app with no frame above want keeps its
+// window icon untouched, and a size the file does not have is never requested, so
+// nothing gets upscaled into place.
+static HICON ExeLargerIcon(const wchar_t* exePath, int want) {
+    const int nativePx = ExeLargestNativePx(exePath);
+    if (nativePx <= want) return nullptr;
+
+    HICON icon = nullptr;
+    if (PrivateExtractIconsW(exePath, 0, nativePx, nativePx, &icon, nullptr, 1, 0) == 1 &&
+        icon) {
+        return icon;
+    }
+    return nullptr;
+}
+
 // App icon for the panel.
 //
 // Order: for an Explorer folder window the shell's 256px folder icon, then the
@@ -2272,19 +2375,50 @@ static HICON AcquireAppIcon(HWND hwnd, int wantPx, bool* needDestroy) {
 
     // Short timeout plus SMTO_ABORTIFHUNG: a hung window must not stall the first
     // frame of the animation.
+    //
+    // The icon these return is measured, not trusted: apps set their ICON_BIG to
+    // whatever the title bar needs, and for Qt programs that is a 32px frame even
+    // when the exe itself ships 256px and more (measured on WPS: Qt5QWindowIcon
+    // answers ICON_BIG with 32x32; its exe carries a 512px frame). Drawn at 64px
+    // and up, a 32px source is visibly blurry, so when the window's icon measures
+    // below the size about to be drawn, the exe's largest native frame replaces
+    // it - and only when the exe really has one (read from the frame table, see
+    // ExeLargerIcon), which keeps every app whose icon is intentionally small or
+    // personal exactly what it chose.
     DWORD_PTR res = 0;
+    HICON windowIcon = nullptr;
     if (SendMessageTimeoutW(hwnd, WM_GETICON, ICON_BIG, 0, SMTO_ABORTIFHUNG, 30, &res) &&
         res) {
-        return (HICON)res;
+        windowIcon = (HICON)res;
+    } else if (SendMessageTimeoutW(hwnd, WM_GETICON, ICON_SMALL2, 0, SMTO_ABORTIFHUNG, 30,
+                                   &res) &&
+               res) {
+        windowIcon = (HICON)res;
     }
-    if (SendMessageTimeoutW(hwnd, WM_GETICON, ICON_SMALL2, 0, SMTO_ABORTIFHUNG, 30, &res) &&
-        res) {
-        return (HICON)res;
+    if (!windowIcon) {
+        windowIcon = (HICON)GetClassLongPtr(hwnd, GCLP_HICON);
     }
-    HICON icon = (HICON)GetClassLongPtr(hwnd, GCLP_HICON);
-    if (icon) return icon;
-    icon = (HICON)GetClassLongPtr(hwnd, GCLP_HICONSM);
-    if (icon) return icon;
+    if (!windowIcon) {
+        windowIcon = (HICON)GetClassLongPtr(hwnd, GCLP_HICONSM);
+    }
+    if (windowIcon) {
+        // A measured-or-larger icon goes out untouched. An icon that cannot be
+        // measured at all - IconPixelSize reports 0 for a failed GetIconInfo or a
+        // colourless (mono) icon - also goes out untouched: with no size there is
+        // no "strictly larger" to test against, and the old behaviour applies.
+        const int ownPx = IconPixelSize(windowIcon);
+        if (ownPx >= want) return windowIcon;
+        if (ownPx > 0) {
+            if (HICON larger = ExeLargerIcon(g_thisExePath.c_str(), want)) {
+                Wh_Log(L"  window icon %dpx below the %dpx target, using the exe's "
+                       L"%dpx frame instead",
+                       ownPx, want, IconPixelSize(larger));
+                *needDestroy = true;
+                return larger;
+            }
+        }
+        return windowIcon;
+    }
     if (!g_thisExePath.empty()) {
         HICON large = nullptr;
         if (ExtractIconExW(g_thisExePath.c_str(), 0, &large, nullptr, 1) > 0 && large) {
